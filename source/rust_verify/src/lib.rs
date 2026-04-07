@@ -76,5 +76,6 @@ mod trait_check_generate;
 mod trait_conflicts;
 mod user_filter;
 pub mod util;
+mod verification_cache;
 pub mod verifier;
 pub mod verus_items;

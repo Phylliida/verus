@@ -346,6 +346,8 @@ pub struct Verifier {
     expand_flag: bool,
 
     error_format: Option<ErrorOutputType>,
+
+    count_cached: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -523,6 +525,7 @@ impl Verifier {
 
             expand_flag: false,
             error_format: None,
+            count_cached: 0,
         }
     }
 
@@ -572,6 +575,7 @@ impl Verifier {
 
             expand_flag: self.expand_flag,
             error_format: self.error_format,
+            count_cached: 0,
         }
     }
 
@@ -579,6 +583,7 @@ impl Verifier {
     pub fn merge(&mut self, other: Self) {
         self.count_verified += other.count_verified;
         self.count_errors += other.count_errors;
+        self.count_cached += other.count_cached;
         self.func_fails.extend(other.func_fails);
         self.time_vir += other.time_vir;
         self.time_vir_rust_to_vir += other.time_vir_rust_to_vir;
@@ -1482,6 +1487,20 @@ impl Verifier {
 
         let function_decl_commands = Arc::new(function_decl_commands);
 
+        // Build cache state: base = entire pruned krate hash, per-function = SST hashes
+        let cache = if self.args.cache {
+            let mut base = crate::verification_cache::ContextHasher::new();
+            base.update_tag(&format!("solver:{:?}", self.args.solver));
+            base.update_debug(&krate);
+            let mut bc = crate::verification_cache::BucketCache::new(base);
+            for function in krate.functions.iter() {
+                bc.record_function(function);
+            }
+            Some(bc)
+        } else {
+            None
+        };
+
         let bucket = self.get_bucket(bucket_id);
         let mut opgen = OpGenerator::new(ctx, krate, bucket.clone());
         let mut all_context_ops = vec![];
@@ -1557,6 +1576,24 @@ impl Verifier {
                         let is_recommend = query_op.is_recommend();
                         self.expand_flag = query_op.is_expanded();
 
+                        // Cache: compute key, skip if cached (key reused for store below)
+                        let cache_key = if let Some(ref bc) = cache {
+                            bc.try_key(
+                                bucket_id,
+                                &function_opgen.ctx().global,
+                                query_op,
+                                function,
+                            )
+                        } else {
+                            None
+                        };
+                        if let (Some(key), Some(bc)) = (&cache_key, &cache) {
+                            if bc.lookup(key) {
+                                self.count_cached += 1;
+                                continue;
+                            }
+                        }
+
                         let mut spinoff_context_counter = 1;
 
                         let mut any_invalid = false;
@@ -1583,7 +1620,8 @@ impl Verifier {
                                 == vir::def::ProverChoice::Nonlinear)
                                 || (cmds.prover_choice == vir::def::ProverChoice::BitVector)
                                 || *profile_rerun
-                                || self.args.spinoff_all;
+                                || self.args.spinoff_all
+                                || self.args.cache;
 
                             let profile_file_name = if *profile_rerun
                                 || ((self.args.profile_all || self.args.capture_profiles)
@@ -1819,6 +1857,13 @@ impl Verifier {
                             if let Some(rlimit_count) = &mut func_stats.rlimit_count {
                                 *rlimit_count += func_curr_smt_rlimit_count
                                     .expect("current rlimit count should be present");
+                            }
+                        }
+
+                        // Cache store on success
+                        if let (Some(key), Some(bc)) = (&cache_key, &cache) {
+                            if !any_invalid && !any_timed_out {
+                                bc.store(key);
                             }
                         }
 
@@ -3436,15 +3481,21 @@ impl VerifierCallbacksEraseMacro {
             && !self.verifier.encountered_error
             && !self.verifier.encountered_vir_error
         {
+            let cached_msg = if self.verifier.count_cached > 0 {
+                format!(", {} cached", self.verifier.count_cached)
+            } else {
+                String::new()
+            };
             println!(
-                "verification results:: {} verified, {} errors{}",
+                "verification results:: {} verified, {} errors{}{}",
                 self.verifier.count_verified,
                 self.verifier.count_errors,
+                cached_msg,
                 if !crate::driver::is_verifying_entire_crate(&self.verifier) {
                     " (partial verification with `--verify-*`)"
                 } else {
                     ""
-                }
+                },
             );
         }
     }
